@@ -1,5 +1,6 @@
 import io
 import time
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -95,6 +96,8 @@ SECTORS = {
     "Media": ("^CNXMEDIA", ["SUNTV", "ZEEL", "PVRINOX", "TV18BRDCST"]),
 }
 SECTOR_OF = {s + ".NS": k for k, (_, lst) in SECTORS.items() for s in lst}
+APP_URL = "https://wealthify-samayak.streamlit.app"  # change this if you rename the app
+METHODS = ["DCF-based (future)", "Blend with market", "Historical"]
 PROFILES = {"Conservative": (0.10, "minvol"), "Moderate": (0.15, "sharpe"), "Aggressive": (0.25, "sharpe")}
 DEFAULT_SYMBOLS = ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ITC", "LT", "SUNPHARMA", "MARUTI"]
 
@@ -349,7 +352,8 @@ def build(px, profile, equal, target, use_groups, amount, rf, method="Historical
         w, met = optimise(rets, cap, goal, rf, target, groups, mu_in=mu.values, minw=minw)
     st.session_state.pop("scen", None)
     st.session_state["portfolio"] = dict(weights=pd.Series(w, index=px.columns), prices=px, rf=rf,
-                                         amount=amount, profile=profile, target=target, met=met, mu=mu, method=method, basis=basis, case=case, horizon=horizon,
+                                         amount=amount, profile=profile, target=target, met=met, mu=mu, method=method, basis=basis, case=case, horizon=horizon, minw=minw, equal=equal,
+                                         years=max(1, round((px.index[-1] - px.index[0]).days / 365.25)),
                                          dropped=[t.replace(".NS", "") for t in asked if t not in px.columns])
 
 
@@ -402,6 +406,14 @@ def show(p):
     else:
         st.caption("Historical mode uses past average returns, which can overstate the future after a strong run. Blend mode averages them "
                    "(capped at 30%) with a market-implied return (risk-free rate + beta x 5.5%). Neither is a forecast.")
+    st.markdown("**Share this portfolio**")
+    syms = ",".join(t.replace(".NS", "") for t in p["weights"].index)
+    link = (f"{APP_URL}/?s={quote(syms, safe=',')}&p={quote(p['profile'])}&y={p.get('years', 3)}&a={int(p['amount'])}"
+            f"&m={METHODS.index(p['method'])}&c={p.get('case', 'Neutral')}&h={p.get('horizon', 3)}"
+            f"&w={p.get('minw', 0.01) * 100:g}&e={int(p.get('equal', False))}")
+    st.code(link, language=None)
+    st.caption("Anyone who opens this link gets the same stocks and settings, then builds with live data and sees their own result.")
+
 
 
 universe = load_universe()
@@ -438,26 +450,42 @@ with st.container(border=True):
 head("build", "pie_chart", "Build your portfolio", "Choose a path. Both end in the same portfolio view.")
 mode = st.radio("Path", ["I will pick the stocks", "Recommend a portfolio for me"], horizontal=True,
                 label_visibility="collapsed")
+qp = st.query_params
+
+
+def qget(k, default, cast=str):
+    try:
+        return cast(qp.get(k, default))
+    except Exception:
+        return default
+
+
+shared = [x for x in qget("s", "").split(",") if x]
 labels = universe["label"].tolist()
-defaults = [x for x in labels if any(x.endswith(f"({s})") for s in DEFAULT_SYMBOLS)]
+defaults = [x for x in labels if any(x.endswith(f"({s})") for s in (shared or DEFAULT_SYMBOLS))]
+q_profile = qget("p", "Moderate") if qget("p", "Moderate") in PROFILES else "Moderate"
+q_case = qget("c", "Neutral") if qget("c", "Neutral") in ("Bear", "Neutral", "Bull") else "Neutral"
+q_method = min(max(qget("m", 0, int), 0), 2)
 with st.container(border=True):
     z1, z2, z3 = st.columns(3)
-    amount = z1.number_input("Amount to invest (Rs)", 100000, 1000000000, 5000000, step=100000)
+    amount = z1.number_input("Amount to invest (Rs)", 100000, 1000000000, min(max(qget("a", 5000000, int), 100000), 1000000000), step=100000)
     rf = z2.number_input("Risk-free rate (%)", 0.0, 12.0, 6.5, step=0.1) / 100
-    years = z3.slider("Price history (years)", 1, 5, 3)
-    method = st.radio("Expected returns based on", ["DCF-based (future)", "Blend with market", "Historical"], horizontal=True)
+    years = z3.slider("Price history (years)", 1, 5, min(max(qget("y", 3, int), 1), 5))
+    method = st.radio("Expected returns based on", METHODS, index=q_method, horizontal=True)
     case, horizon = "Neutral", 3
     if method.startswith("DCF"):
         m1, m2 = st.columns(2)
-        case = m1.radio("DCF case to build on", ["Bear", "Neutral", "Bull"], index=1, horizontal=True)
-        horizon = m2.slider("Years for the price to reach fair value", 1, 5, 3, key="h_build")
-    minw = st.slider("Minimum weight per selected stock (%)", 0.0, 5.0, 1.0, 0.5) / 100
+        case = m1.radio("DCF case to build on", ["Bear", "Neutral", "Bull"], index=["Bear", "Neutral", "Bull"].index(q_case), horizontal=True)
+        horizon = m2.slider("Years for the price to reach fair value", 1, 5, min(max(qget("h", 3, int), 1), 5), key="h_build")
+    minw = st.slider("Minimum weight per selected stock (%)", 0.0, 5.0, min(max(qget("w", 1.0, float), 0.0), 5.0), 0.5) / 100
     if mode == "I will pick the stocks":
         picked = st.multiselect("Pick 3 to 40 stocks (type to search all NSE stocks)", labels, default=defaults)
         y1, y2 = st.columns(2)
-        profile = y1.selectbox("Risk profile", list(PROFILES), index=1)
-        weighting = y2.radio("Weighting", ["Optimised", "Equal"], horizontal=True)
-        if st.button("Build portfolio"):
+        profile = y1.selectbox("Risk profile", list(PROFILES), index=list(PROFILES).index(q_profile))
+        weighting = y2.radio("Weighting", ["Optimised", "Equal"], index=min(max(qget("e", 0, int), 0), 1), horizontal=True)
+        auto = bool(shared) and not st.session_state.get("auto_done")
+        if st.button("Build portfolio") or auto:
+            st.session_state["auto_done"] = True
             if not 3 <= len(picked) <= 40:
                 st.warning("Pick between 3 and 40 stocks.")
             else:
