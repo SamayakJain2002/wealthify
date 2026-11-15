@@ -96,6 +96,15 @@ SECTORS = {
     "Media": ("^CNXMEDIA", ["SUNTV", "ZEEL", "PVRINOX", "TV18BRDCST"]),
 }
 SECTOR_OF = {s + ".NS": k for k, (_, lst) in SECTORS.items() for s in lst}
+# Rule-of-thumb sector traits, 0 to 2: defensive, cyclical, benefits from falling rates, dividend/income, growth. Assumptions, not research.
+SECTOR_TAGS = {
+    "IT": (1, 1, 0, 1, 2), "Banks": (0, 2, 1, 1, 1), "PSU banks": (0, 2, 1, 2, 1), "Financial services": (0, 2, 2, 0, 2),
+    "Insurance": (1, 1, 1, 0, 2), "Pharma": (2, 0, 0, 1, 1), "Healthcare services": (2, 0, 0, 0, 2), "Auto": (0, 2, 2, 1, 1),
+    "FMCG": (2, 0, 0, 1, 1), "Consumer and retail": (0, 2, 1, 0, 2), "Consumer durables": (0, 2, 2, 0, 2),
+    "Energy": (1, 1, 0, 2, 0), "Power": (2, 0, 2, 2, 1), "Metals": (0, 2, 0, 1, 0), "Infrastructure": (0, 2, 2, 0, 2),
+    "Capital goods and defence": (0, 2, 1, 0, 2), "Cement": (0, 2, 2, 1, 1), "Chemicals": (0, 2, 0, 0, 1),
+    "Realty": (0, 2, 2, 0, 1), "Telecom": (2, 0, 0, 0, 1), "Media": (0, 2, 1, 1, 0),
+}
 APP_URL = "https://wealthify-samayak.streamlit.app"  # change this if you rename the app
 METHODS = ["DCF-based (future)", "Blend with market", "Historical"]
 PROFILES = {"Conservative": (0.10, "minvol"), "Moderate": (0.15, "sharpe"), "Aggressive": (0.25, "sharpe")}
@@ -336,6 +345,114 @@ def scenario_block(p):
                    "in every case. Holdings under 1% also keep it. Estimates only, not forecasts.")
 
 
+def sector_fit(goal, style, economy, rates, yrs):
+    """Scores each sector against the investor's answers using the rule-of-thumb traits above."""
+    out = {}
+    for k, (d, c, r, v, g) in SECTOR_TAGS.items():
+        out[k] = ({"Stable and defensive": 1.0, "A mix": 0.0, "Growth and cyclical": -1.0}[style] * (d - c)
+                  + {"Strong growth": -0.5, "Steady": 0.0, "Slowing": 0.5}[economy] * (d - c)
+                  + {"Falling": 1.0, "Stable": 0.0, "Rising": -1.0}[rates] * (r - 1) * 0.5
+                  + (v - 1 if goal == "Regular income" else 0)
+                  + {"Growth": 1.0, "Balanced": 0.3, "Regular income": 0.0}[goal] * (g - 1) * (0.5 + min(yrs, 10) / 20))
+    return pd.Series(out)
+
+
+def advice_block():
+    adv = st.session_state.get("advice")
+    if adv is None:
+        return
+    st.markdown("**Sector view from your answers**")
+    st.dataframe(adv, width="stretch", hide_index=True)
+    dn = st.session_state.get("dropped_neg")
+    if dn:
+        st.caption("Left out because their DCF outlook is below the risk-free rate: " + ", ".join(dn) + ".")
+    st.caption("Focus = sectors the portfolio tilts towards. Avoid = the weakest fit and recent trend among the sectors you did not exclude. "
+               "Sector traits are rough rules of thumb, not research.")
+
+
+def explorer_section(p):
+    px, mu = p["prices"], p.get("mu")
+    rets = px.pct_change().dropna()
+    if mu is None:
+        mu = rets.mean() * 252
+    cov, m, rf, cols = rets.cov().values * 252, mu.values, p["rf"], list(px.columns)
+    sig = "|".join(cols) + f"|{p['method']}|{p.get('case')}|{p.get('horizon')}|{p['profile']}|{rf}"
+    ex = st.session_state.get("explorer")
+    if not ex or ex["sig"] != sig:
+        W = np.random.default_rng(1).dirichlet(np.full(len(m), 0.3), size=4000)
+        cap = PROFILES[p["profile"]][0]
+        capx = max(cap, 1.0 / len(m) + 0.02)
+        w_min, _ = optimise(rets, cap, "minvol", rf, None, None, mu_in=m)
+        w_sh, _ = optimise(rets, cap, "sharpe", rf, None, None, mu_in=m)
+        w_hi, left = np.zeros(len(m)), 1.0
+        for i in np.argsort(-m):
+            x = min(capx, left)
+            w_hi[i], left = x, left - x
+            if left <= 1e-9:
+                break
+        ports, r_lo, r_hi = [("Lowest risk", w_min)], float(w_min @ m), float(w_hi @ m)
+        if r_hi - r_lo > 0.005:
+            for name, t in zip(["Cautious", "Balanced", "Growth"], np.linspace(r_lo, r_hi, 5)[1:4]):
+                ports.append((name, optimise(rets, cap, "minvol", rf, t, None, mu_in=m)[0]))
+            ports.append(("Highest return", w_hi))
+        ports.append(("Best Sharpe", w_sh))
+        ex = dict(sig=sig, cr=W @ m, cv=np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W)),
+                  ports=[(n, w, float(w @ m), float(np.sqrt(w @ cov @ w))) for n, w in ports])
+        st.session_state["explorer"] = ex
+    names = [q[0] for q in ex["ports"]]
+    fig = go.Figure()
+    fig.add_scatter(x=ex["cv"] * 100, y=ex["cr"] * 100, mode="markers", name="Random portfolios",
+                    marker=dict(size=5, opacity=0.6, color=(ex["cr"] - rf) / ex["cv"], colorscale="Blues", showscale=True,
+                                colorbar=dict(title="Sharpe")), hovertemplate="Risk %{x:.1f}%<br>Return %{y:.1f}%<extra></extra>")
+    fig.add_scatter(x=[q[3] * 100 for q in ex["ports"]], y=[q[2] * 100 for q in ex["ports"]], mode="markers+text", text=names,
+                    textposition="top center", name="Recommended",
+                    marker=dict(size=17, line=dict(width=2, color="#FFFFFF"),
+                                color=["#E5484D", "#F5A524", "#2F6FED", "#0E9F6E", "#7C5CFF", "#0F2A4A", "#0F2A4A"][:len(names)]))
+    fig.update_layout(template="plotly_white", height=460, margin=dict(t=10, b=10), font=dict(family="Manrope"), showlegend=False,
+                      xaxis_title="Risk (volatility, % a year)", yaxis_title="Expected return (% a year)")
+    bid = st.session_state.get("build_id", 0)
+    ev = st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points", key=f"exp_{bid}")
+    pick = None
+    try:
+        hit = [q for q in ev.selection.points if q.get("curve_number") == 1]
+        if hit:
+            pick = int(hit[0].get("point_index", hit[0].get("point_number")))
+    except Exception:
+        pass
+    c1, c2 = st.columns([4, 1])
+    choice = c1.radio("Or choose a recommended portfolio", names, horizontal=True, key=f"exr_{bid}")
+    via_btn = c2.button("Load it", key=f"exb_{bid}")
+    if via_btn:
+        pick = names.index(choice)
+    if pick is not None and 0 <= pick < len(names) and (via_btn or st.session_state.get("applied") != (bid, pick)):
+        st.session_state["applied"] = (bid, pick)
+        st.session_state["portfolio"]["weights"] = pd.Series(ex["ports"][pick][1], index=cols)
+        st.session_state["portfolio"]["label"] = names[pick]
+        st.session_state.pop("scen", None)
+        st.rerun()
+    st.dataframe(pd.DataFrame([(n, round(r * 100, 1), round(v * 100, 1), round((r - rf) / v, 2), int((w >= 0.01).sum()))
+                               for n, w, r, v in ex["ports"]],
+                              columns=["Portfolio", "Expected return %", "Volatility %", "Sharpe", "Stocks held (1%+)"]),
+                 width="stretch", hide_index=True)
+    st.caption("Blue dots are 4,000 random mixes of your stocks, shaded by Sharpe ratio. Highlighted dots are optimised for different "
+               "risk levels. Click one, or use the buttons, to load it into the results above. They use your expected-return method, "
+               "may drop weak stocks, and are estimates, not forecasts.")
+    st.markdown("**Consider avoiding**")
+    weak = mu[mu < rf].sort_values()
+    never = [t for i, t in enumerate(cols) if all(q[1][i] < 0.005 for q in ex["ports"])]
+    sec_mu = mu.groupby([SECTOR_OF.get(t, "Other") for t in mu.index]).mean()
+    weak_sec = sec_mu[(sec_mu < rf) & (sec_mu.index != "Other")]
+    lines = []
+    if len(weak):
+        lines.append("Expected return below the risk-free rate: " + ", ".join(f"{t.replace('.NS', '')} ({v * 100:.0f}%)" for t, v in weak.items()))
+    if never:
+        lines.append("Dropped by every recommended portfolio: " + ", ".join(t.replace(".NS", "") for t in never))
+    if len(weak_sec):
+        lines.append("Sectors with a weak outlook in your list: " + ", ".join(f"{k} ({v * 100:.0f}%)" for k, v in weak_sec.items()))
+    st.markdown("\n".join(f"- {x}" for x in lines) if lines else "Nothing stands out under your current return estimates.")
+    st.caption("A flag means the estimates are weak for that stock or sector, not that it will fall. Check it in the Stock Analyser first.")
+
+
 def build(px, profile, equal, target, use_groups, amount, rf, method="Historical", case="Neutral", horizon=3, minw=0.0, asked=()):
     if px.shape[1] < 3:
         st.error("Not enough price data came back. Try other stocks or a shorter history.")
@@ -351,6 +468,7 @@ def build(px, profile, equal, target, use_groups, amount, rf, method="Historical
         groups = [SECTOR_OF.get(t, "Other") for t in px.columns] if use_groups else None
         w, met = optimise(rets, cap, goal, rf, target, groups, mu_in=mu.values, minw=minw)
     st.session_state.pop("scen", None)
+    st.session_state["build_id"] = st.session_state.get("build_id", 0) + 1
     st.session_state["portfolio"] = dict(weights=pd.Series(w, index=px.columns), prices=px, rf=rf,
                                          amount=amount, profile=profile, target=target, met=met, mu=mu, method=method, basis=basis, case=case, horizon=horizon, minw=minw, equal=equal,
                                          years=max(1, round((px.index[-1] - px.index[0]).days / 365.25)),
@@ -366,6 +484,8 @@ def show(p):
     v = float(np.sqrt(w.values @ cov.values @ w.values))
     curve = (1 + rets @ w).cumprod()
     dd = float((curve / curve.cummax() - 1).min())
+    if p.get("label"):
+        st.info(f"Showing the {p['label']} portfolio from the explorer below.")
     if p.get("dropped"):
         st.warning("Left out because Yahoo has too little price history: " + ", ".join(p["dropped"]) + ". Try a shorter history.")
     k = st.columns(4)
@@ -392,6 +512,10 @@ def show(p):
     if p.get("basis") is not None:
         tbl["Basis"] = p["basis"].reindex(w.index).values
     tbl = tbl[tbl["Weight %"] >= 0.1].sort_values("Weight %", ascending=False)
+    neg = [k for k in tbl.index if tbl.loc[k, "Return %"] < 0]
+    if neg and p.get("minw", 0) > 0:
+        st.warning(f"{len(neg)} holding(s) have a negative expected return but are held at your minimum weight. "
+                   "Set the minimum weight to 0 to let the optimiser drop them.")
     sw = (w.groupby(sec_of).sum() * 100).sort_values(ascending=False)
     c1, c2 = st.columns([3, 2])
     c1.dataframe(tbl, width="stretch", height=380)
@@ -419,7 +543,7 @@ def show(p):
 universe = load_universe()
 sec = sector_table()
 
-nav = [("sectors", "Sectors"), ("build", "Build portfolio"), ("stocks", "Stock analyser"),
+nav = [("sectors", "Sectors"), ("build", "Build portfolio"), ("explore", "Explorer"), ("stocks", "Stock analyser"),
        ("risk", "Risk"), ("backtest", "Backtest"), ("tax", "Tax")]
 links = "".join(f"<a href='#{a}' target='_self'>{t}</a>" for a, t in nav)
 st.markdown(f"<div class='topbar'><div class='brand'><div class='mark'>W</div>Wealthify</div>"
@@ -486,6 +610,7 @@ with st.container(border=True):
         auto = bool(shared) and not st.session_state.get("auto_done")
         if st.button("Build portfolio") or auto:
             st.session_state["auto_done"] = True
+            st.session_state.pop("advice", None)
             if not 3 <= len(picked) <= 40:
                 st.warning("Pick between 3 and 40 stocks.")
             else:
@@ -500,19 +625,46 @@ with st.container(border=True):
         likes = st.multiselect("Sectors you like (optional)", list(SECTORS))
         avoid = st.multiselect("Sectors to avoid (optional)", [x for x in SECTORS if x not in likes])
         n = st.slider("Number of stocks", 10, 40, 25)
+        q1, q2, q3 = st.columns(3)
+        goal = q1.selectbox("What matters most?", ["Growth", "Balanced", "Regular income"], index=1)
+        style = q2.selectbox("Preferred kind of businesses", ["Stable and defensive", "A mix", "Growth and cyclical"], index=1)
+        horizon_y = q3.slider("Years you can stay invested", 1, 15, 5)
+        q4, q5 = st.columns(2)
+        economy = q4.selectbox("Your view of the economy (next 2 years)", ["Strong growth", "Steady", "Slowing"], index=1)
+        rates = q5.selectbox("Where do you expect interest rates to go?", ["Falling", "Stable", "Rising"], index=1)
         if st.button("Recommend and build"):
             pool = [x for x in SECTORS if x not in avoid]
             if len(pool) < 3:
                 st.warning("Keep at least 3 sectors so the portfolio stays diversified.")
             else:
-                score = sec.rank(pct=True)[["3M", "1Y"]].mean(axis=1) if not sec.empty else pd.Series(dtype=float)
-                order = sorted(pool, key=lambda x: -(score.get(x, 0.5) + (0.3 if x in likes else 0)))
+                fit = sector_fit(goal, style, economy, rates, horizon_y)
+                mr = sec.rank(pct=True)[["3M", "1Y"]].mean(axis=1) if not sec.empty else pd.Series(dtype=float)
+                fr = fit.rank(pct=True)
+                total = {x: 0.5 * mr.get(x, 0.5) + 0.5 * fr[x] + (0.3 if x in likes else 0) for x in pool}
+                order = sorted(pool, key=lambda x: -total[x])
                 k = max({"Conservative": 6, "Moderate": 5, "Aggressive": 4}[profile], -(-n // 7))
                 chosen = order[:max(3, min(len(pool), max(k, len(likes))))]
+                avoid_list = [x for x in order if x not in chosen][-4:]
+                fr_all = fit.rank(pct=True)
+                m3 = sec["3M"] if not sec.empty else pd.Series(dtype=float)
+                adv = pd.DataFrame([(x, a, m3.get(x), fr_all[x]) for a, lst in (("Focus", chosen), ("Avoid", avoid_list)) for x in lst],
+                                   columns=["Sector", "Action", "3M %", "Fit"])
+                adv["Fit"] = pd.cut(adv["Fit"], [-0.01, 0.33, 0.66, 1.0], labels=["Poor", "Neutral", "Good"])
+                st.session_state["advice"] = adv
                 cands = tuple(x + ".NS" for c in chosen for x in SECTORS[c][1])
                 with st.spinner("Screening stocks in the best sectors..."):
                     pa = get_prices(cands, years)
-                mom = pa.iloc[-1] / pa.iloc[-126] - 1
+                dropped_neg = []
+                if method.startswith("DCF"):
+                    with st.spinner("Valuing candidate stocks (first run is slow)..."):
+                        mom, _ = expected_returns(pa, pa.pct_change().dropna(), rf, method, case, horizon)
+                    keep = mom[mom > rf].index
+                    if len(keep) >= max(8, n // 2):
+                        dropped_neg = [t.replace(".NS", "") for t in pa.columns if t not in keep]
+                        pa, mom = pa[keep], mom[keep]
+                else:
+                    mom = pa.iloc[-1] / pa.iloc[-126] - 1
+                st.session_state["dropped_neg"] = dropped_neg
                 per = -(-n // len(chosen))
                 sel = []
                 for c in chosen:
@@ -525,6 +677,7 @@ with st.container(border=True):
 p = st.session_state.get("portfolio")
 if p:
     with st.container(border=True):
+        advice_block()
         show(p)
         scenario_block(p)
 
@@ -538,6 +691,14 @@ def stats(v):
 def fmt(v, mult=1, suffix="", dec=1):
     return "n/a" if v is None else f"{v * mult:,.{dec}f}{suffix}"
 
+
+# ---------- Portfolio explorer ----------
+head("explore", "scatter_plot", "Portfolio explorer", "Thousands of random portfolios, with the best ones highlighted. Click a highlighted dot to load it.")
+with st.container(border=True):
+    if not p:
+        st.info("Build a portfolio above first. This page uses it.")
+    else:
+        explorer_section(p)
 
 # ---------- Stock analyser ----------
 head("stocks", "search", "Stock analyser", "Valuation, ratios and charts for each holding.")
