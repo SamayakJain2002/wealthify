@@ -776,4 +776,3 @@ with st.container(border=True):
 st.markdown("<div class='foot'>For educational purposes only. Nothing here is investment advice or a recommendation "
             "to buy or sell. Market data comes from Yahoo Finance and NSE and may be delayed or incomplete. "
             "Past performance does not guarantee future results. Made by Samayak Jain.</div>", unsafe_allow_html=True)
-            "Past performance does not guarantee future results. Made by Samayak Jain.</div>", unsafe_allow_html=True)
