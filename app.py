@@ -549,6 +549,24 @@ with st.container(border=True):
             st.caption((f"Starting growth is based on this company's past revenue growth of {g * 100:.0f}% a year. " if g is not None
                         else "Past revenue growth was not available, so 10% is the starting point. ")
                        + "Adjust any case below, and use research reports you trust for the sector outlook.")
+            last = float(ser.iloc[-1])
+            mcap = last * shares
+            with st.expander("Data used in this DCF (check it against a source you trust)"):
+                st.markdown(
+                    f"- **Price:** Rs {last:,.1f}, the last close from Yahoo Finance ({ser.index[-1].date()})\n"
+                    f"- **Shares outstanding (Yahoo):** {shares / 1e7:,.1f} crore, so market cap is about Rs {mcap / 1e7:,.0f} crore\n"
+                    f"- **Starting free cash flow:** Rs {fcf / 1e7:,.0f} crore, the average of up to 3 recent years from Yahoo's cash flow statement\n"
+                    f"- **Free cash flow yield:** {fcf / mcap * 100:.1f}% of market cap\n"
+                    f"- **Past revenue growth:** " + (f"{g * 100:.1f}% a year (Yahoo, about 3 to 4 years). Used only to set the default growth, not in the valuation."
+                                                      if g is not None else "not available") + "\n"
+                    f"- **Sector:** {info.get('sector', 'n/a')}")
+                yc = info.get("marketCap")
+                if yc and abs(mcap / yc - 1) > 0.3:
+                    st.warning("Yahoo's share count and its market cap disagree by more than 30%, so the share data may be wrong. "
+                               "Treat the per-share values with suspicion.")
+                if info.get("sector") in ("Financial Services", "Real Estate"):
+                    st.warning("Free cash flow DCFs are unreliable for banks, lenders and real estate companies, because their "
+                               "operating cash flow includes loans and project cycles.")
             view = view_picker("v_sa")
             asm = {}
             with st.expander("Adjust the assumptions for each case"):
@@ -579,12 +597,18 @@ with st.container(border=True):
                 fig.update_layout(template="plotly_white", height=300, margin=dict(t=10, b=10), font=dict(family="Manrope"),
                                   yaxis_title="Value per share (Rs)")
                 st.plotly_chart(fig, width="stretch")
+            for n in names:
+                if vals[n] and not 0.33 <= vals[n] / price <= 3:
+                    st.warning(f"{n} case: the DCF value is {vals[n] / price:.1f}x the current price. That usually means the inputs "
+                               "(especially a small gap between the discount rate and long-term growth) or Yahoo's data need checking.")
             sc_case = "Neutral" if view == "Compare" else view
             gg, rr, tt = asm[sc_case]
             full = dcf_full(fcf, shares, gg / 100, rr / 100, tt / 100)
             if full:
                 st.caption(f"{sc_case} case: {full[1] * 100:.0f}% of the value comes from the long-term (terminal) stage."
                            + (" That is high, so treat the result with care." if full[1] > 0.75 else ""))
+                st.caption(f"Terminal multiple: the long-term stage values the business at about "
+                           f"{(1 + tt / 100) / ((rr - tt) / 100):.0f}x its year-10 cash flow.")
                 rates = [rr + d for d in (-2, -1, 0, 1, 2)]
                 tgs = [tt + d for d in (-1, 0, 1)]
                 grid = pd.DataFrame({f"LT growth {x:.1f}%": [dcf_value(fcf, shares, gg / 100, r_ / 100, x / 100) for r_ in rates]
@@ -751,4 +775,5 @@ with st.container(border=True):
 
 st.markdown("<div class='foot'>For educational purposes only. Nothing here is investment advice or a recommendation "
             "to buy or sell. Market data comes from Yahoo Finance and NSE and may be delayed or incomplete. "
+            "Past performance does not guarantee future results. Made by Samayak Jain.</div>", unsafe_allow_html=True)
             "Past performance does not guarantee future results. Made by Samayak Jain.</div>", unsafe_allow_html=True)
